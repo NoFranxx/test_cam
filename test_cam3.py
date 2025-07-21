@@ -1,15 +1,19 @@
 import cv2
-import numpy as np
 import mediapipe as mp
+import numpy as np
 import pyautogui
+import threading
+import queue
+import time
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, Tuple, List
 from enum import Enum
 import json
-import time
-import os
+import logging
 
-pyautogui.FAILSAFE = False
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class DetectionMode(Enum):
     MEDIAPIPE_ONLY = "mediapipe"
@@ -17,688 +21,655 @@ class DetectionMode(Enum):
     HYBRID = "hybrid"
 
 @dataclass
-class Config:
-    """Класс конфигурации приложения"""
+class AppConfig:
+    """Конфигурация приложения"""
     # Общие настройки
     camera_index: int = 0
-    camera_width: int = 640
-    camera_height: int = 480
+    camera_width: int = 1280
+    camera_height: int = 720
     fps: int = 30
     
     # Настройки детекции
-    detection_mode: DetectionMode = DetectionMode.ARUCO_ONLY
-    min_detection_confidence: float = 0.5
-    min_tracking_confidence: float = 0.5
-    model_complexity: int = 0  # 0 - легкая модель
+    detection_mode: DetectionMode = DetectionMode.HYBRID
     
-    # Настройки производительности
-    skip_frames: int = 2  # Обрабатывать каждый N-й кадр для MediaPipe
+    # MediaPipe настройки
+    mp_detection_confidence: float = 0.7
+    mp_tracking_confidence: float = 0.5
+    mp_model_complexity: int = 1
     
-    # Настройки ArUco 4x4_50
-    aruco_marker_size_mm: int = 50  # Размер маркера в миллиметрах для печати
-    aruco_detection_threshold: float = 0.1  # Порог детекции
+    # ArUco настройки
+    aruco_dict_type: str = "DICT_4X4_50"  # Изменено на строку
+    aruco_marker_size: float = 0.05  # размер маркера в метрах
     
     # Настройки управления курсором
     cursor_smoothing: float = 0.3
-    cursor_sensitivity: float = 1.5
+    cursor_sensitivity: float = 2.0
+    screen_width: int = pyautogui.size()[0]
+    screen_height: int = pyautogui.size()[1]
     
-    # Настройки отображения
-    show_fps: bool = True
-    show_skeleton: bool = True
-    show_aruco_info: bool = True
+    # Настройки стабилизации
+    use_kalman_filter: bool = True
+    detection_threshold: int = 3  # минимальное количество кадров для подтверждения детекции
     
     def save(self, filename: str = "config.json"):
-        data = {k: v.value if isinstance(v, Enum) else v 
-                for k, v in self.__dict__.items()}
+        """Сохранение конфигурации в файл"""
+        config_dict = {
+            k: v.value if isinstance(v, Enum) else v 
+            for k, v in self.__dict__.items()
+        }
         with open(filename, 'w') as f:
-            json.dump(data, f, indent=4)
+            json.dump(config_dict, f, indent=4)
     
     @classmethod
-    def load(cls, filename: str = "config.json"):
+    def load(cls, filename: str = "config.json") -> 'AppConfig':
+        """Загрузка конфигурации из файла"""
         try:
             with open(filename, 'r') as f:
-                data = json.load(f)
-            config = cls()
-            for k, v in data.items():
-                if k == 'detection_mode':
-                    setattr(config, k, DetectionMode(v))
-                else:
-                    setattr(config, k, v)
-            return config
+                config_dict = json.load(f)
+            config_dict['detection_mode'] = DetectionMode(config_dict.get('detection_mode', 'hybrid'))
+            return cls(**config_dict)
         except FileNotFoundError:
+            logger.warning(f"Файл конфигурации {filename} не найден. Используются настройки по умолчанию.")
             return cls()
 
-class BodyLandmarks:
-    """Класс для хранения всех меток тела"""
+class KalmanFilter:
+    """Фильтр Калмана для сглаживания координат"""
     def __init__(self):
-        self.landmarks = {
-            'head': None,
-            'left_shoulder': None,
-            'right_shoulder': None,
-            'pelvis': None,
-            'left_elbow': None,
-            'left_hand': None,
-            'right_elbow': None,
-            'right_hand': None,
-            'left_knee': None,
-            'left_foot': None,
-            'right_knee': None,
-            'right_foot': None
-        }
+        self.kf = cv2.KalmanFilter(4, 2)
+        self.kf.measurementMatrix = np.array([[1, 0, 0, 0],
+                                             [0, 1, 0, 0]], np.float32)
+        self.kf.transitionMatrix = np.array([[1, 0, 1, 0],
+                                            [0, 1, 0, 1],
+                                            [0, 0, 1, 0],
+                                            [0, 0, 0, 1]], np.float32)
+        self.kf.processNoiseCov = 0.03 * np.eye(4, dtype=np.float32)
+        self.initialized = False
+    
+    def update(self, x: float, y: float) -> Tuple[float, float]:
+        """Обновление фильтра и получение сглаженных координат"""
+        measurement = np.array([[x], [y]], dtype=np.float32)
         
-        # Соответствие ArUco 4x4_50 маркеров (ID от 0 до 11)
-        self.aruco_mapping = {
-            0: 'head',
-            1: 'left_shoulder',
-            2: 'right_shoulder',
-            3: 'pelvis',
-            4: 'left_elbow',
-            5: 'left_hand',
-            6: 'right_elbow',
-            7: 'right_hand',
-            8: 'left_knee',
-            9: 'left_foot',
-            10: 'right_knee',
-            11: 'right_foot'
-        }
+        if not self.initialized:
+            self.kf.statePre = np.array([[x], [y], [0], [0]], dtype=np.float32)
+            self.kf.statePost = np.array([[x], [y], [0], [0]], dtype=np.float32)
+            self.initialized = True
+        
+        self.kf.correct(measurement)
+        prediction = self.kf.predict()
+        
+        return float(prediction[0]), float(prediction[1])
 
-class ArUco4x4Detector:
-    """Специализированный детектор для ArUco 4x4_50"""
-    def __init__(self, config: Config):
+class BodyTracker:
+    """Класс для отслеживания тела с использованием MediaPipe и ArUco"""
+    
+    # Соответствие меток позициям тела
+    BODY_LANDMARKS = {
+        'head': 0,
+        'left_shoulder': 11,
+        'right_shoulder': 12,
+        'pelvis': 23,  # Используем среднее между бедрами
+        'left_elbow': 13,
+        'left_wrist': 15,
+        'right_elbow': 14,
+        'right_wrist': 16,
+        'left_knee': 25,
+        'left_ankle': 27,
+        'right_knee': 26,
+        'right_ankle': 28
+    }
+    
+    # Соответствие ArUco маркеров позициям тела
+    ARUCO_MARKERS = {
+        0: 'head',
+        1: 'left_shoulder',
+        2: 'right_shoulder',
+        3: 'pelvis',
+        4: 'left_elbow',
+        5: 'left_wrist',
+        6: 'right_elbow',
+        7: 'right_wrist',
+        8: 'left_knee',
+        9: 'left_ankle',
+        10: 'right_knee',
+        11: 'right_ankle'
+    }
+    
+    def __init__(self, config: AppConfig):
         self.config = config
         
-        # Используем именно DICT_4X4_50
-        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-        
-        # Оптимизированные параметры для 4x4_50
-        self.aruco_params = cv2.aruco.DetectorParameters()
-        
-        # Настройки для лучшего распознавания 4x4 маркеров
-        self.aruco_params.adaptiveThreshWinSizeMin = 3
-        self.aruco_params.adaptiveThreshWinSizeMax = 23
-        self.aruco_params.adaptiveThreshWinSizeStep = 10
-        self.aruco_params.adaptiveThreshConstant = 7
-        
-        # Настройки для маленьких маркеров 4x4
-        self.aruco_params.minMarkerPerimeterRate = 0.03
-        self.aruco_params.maxMarkerPerimeterRate = 4.0
-        self.aruco_params.polygonalApproxAccuracyRate = 0.05
-        self.aruco_params.minCornerDistanceRate = 0.05
-        
-        # Улучшение детекции углов
-        self.aruco_params.minDistanceToBorder = 3
-        self.aruco_params.minMarkerDistanceRate = 0.05
-        self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-        self.aruco_params.cornerRefinementWinSize = 5
-        self.aruco_params.cornerRefinementMaxIterations = 30
-        self.aruco_params.cornerRefinementMinAccuracy = 0.1
-        
-        # Специфично для 4x4
-        self.aruco_params.markerBorderBits = 1
-        self.aruco_params.perspectiveRemovePixelPerCell = 4  # Меньше для 4x4
-        self.aruco_params.perspectiveRemoveIgnoredMarginPerCell = 0.13
-        
-        # Обработка ошибок
-        self.aruco_params.maxErroneousBitsInBorderRate = 0.35
-        self.aruco_params.minOtsuStdDev = 5.0
-        self.aruco_params.errorCorrectionRate = 0.6
-        
-        self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
-        
-        # Для отслеживания стабильности маркеров
-        self.marker_history = {}
-        self.history_size = 5
-    
-    def preprocess_image(self, frame: np.ndarray) -> np.ndarray:
-        """Предобработка изображения для улучшения детекции"""
-        # Конвертируем в градации серого
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Применяем размытие для уменьшения шума
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # Улучшаем контраст
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        gray = clahe.apply(gray)
-        
-        return gray
-    
-    def detect(self, frame: np.ndarray) -> Optional[BodyLandmarks]:
-        """Детекция ArUco 4x4_50 маркеров"""
-        # Предобработка
-        gray = self.preprocess_image(frame)
-        
-        # Детекция маркеров
-        corners, ids, rejected = self.detector.detectMarkers(gray)
-        
-        if ids is not None and len(ids) > 0:
-            body = BodyLandmarks()
-            
-            for i, marker_id in enumerate(ids.flatten()):
-                if 0 <= marker_id <= 11:  # Проверяем, что ID в нужном диапазоне
-                    # Вычисляем центр маркера с субпиксельной точностью
-                    corner = corners[i][0]
-                    center_x = float(np.mean(corner[:, 0]))
-                    center_y = float(np.mean(corner[:, 1]))
-                    
-                    # Стабилизация позиции
-                    if marker_id not in self.marker_history:
-                        self.marker_history[marker_id] = []
-                    
-                    self.marker_history[marker_id].append((center_x, center_y))
-                    if len(self.marker_history[marker_id]) > self.history_size:
-                        self.marker_history[marker_id].pop(0)
-                    
-                    # Усредняем позицию для стабильности
-                    avg_x = np.mean([p[0] for p in self.marker_history[marker_id]])
-                    avg_y = np.mean([p[1] for p in self.marker_history[marker_id]])
-                    
-                    body_part = self.aruco_mapping.get(marker_id)
-                    if body_part:
-                        body.landmarks[body_part] = (int(avg_x), int(avg_y), 1.0)
-            
-            return body
-        
-        return None
-    
-    def draw(self, frame: np.ndarray, corners, ids):
-        """Отрисовка обнаруженных маркеров"""
-        if ids is not None:
-            # Рисуем контуры маркеров
-            cv2.aruco.drawDetectedMarkers(frame, corners, ids)
-            
-            if self.config.show_aruco_info:
-                for i, marker_id in enumerate(ids.flatten()):
-                    if 0 <= marker_id <= 11:
-                        corner = corners[i][0]
-                        center_x = int(np.mean(corner[:, 0]))
-                        center_y = int(np.mean(corner[:, 1]))
-                        
-                        # Получаем название части тела
-                        body_part = self.aruco_mapping.get(marker_id, "Unknown")
-                        
-                        # Рисуем информацию
-                        cv2.putText(frame, f"{body_part}", 
-                                  (center_x - 30, center_y - 10),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-    
-    def generate_markers(self, output_dir: str = "aruco_4x4_50_markers"):
-        """Генерация ArUco 4x4_50 маркеров для печати"""
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Размер маркера в пикселях (для печати с разрешением 300 DPI)
-        dpi = 300
-        marker_size_px = int(self.config.aruco_marker_size_mm / 25.4 * dpi)
-        
-        print(f"Генерация маркеров размером {self.config.aruco_marker_size_mm}мм ({marker_size_px}px при {dpi}DPI)")
-        
-        for marker_id in range(12):  # ID от 0 до 11
-            # Генерируем маркер
-            marker_img = cv2.aruco.generateImageMarker(
-                self.aruco_dict, marker_id, marker_size_px
-            )
-            
-            # Добавляем белую рамку (20% от размера маркера)
-            border_size = int(marker_size_px * 0.2)
-            marker_with_border = cv2.copyMakeBorder(
-                marker_img, 
-                border_size, border_size * 2,  # Больше места снизу для текста
-                border_size, border_size,
-                cv2.BORDER_CONSTANT, value=255
-            )
-            
-            # Добавляем информацию
-            body_part = self.aruco_mapping.get(marker_id, "Unknown")
-            text = f"ID: {marker_id} - {body_part}"
-            font_scale = marker_size_px / 200
-            thickness = max(1, int(marker_size_px / 100))
-            
-            # Позиция текста
-            text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
-            text_x = (marker_with_border.shape[1] - text_size[0]) // 2
-            text_y = marker_with_border.shape[0] - border_size // 2
-            
-            cv2.putText(marker_with_border, text,
-                       (text_x, text_y),
-                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, 0, thickness)
-            
-            # Сохраняем
-            filename = os.path.join(output_dir, f"aruco_4x4_50_id{marker_id:02d}_{body_part}.png")
-            cv2.imwrite(filename, marker_with_border)
-            print(f"✓ Маркер {marker_id} ({body_part}) сохранен")
-        
-        # Создаем общий лист для печати
-        self.create_marker_sheet(output_dir)
-    
-    def create_marker_sheet(self, output_dir: str):
-        """Создание листа A4 с маркерами для печати"""
-        # A4 размеры при 300 DPI
-        dpi = 300
-        a4_width_px = int(210 / 25.4 * dpi)  # 210mm
-        a4_height_px = int(297 / 25.4 * dpi)  # 297mm
-        
-        # Создаем белый лист
-        sheet = np.ones((a4_height_px, a4_width_px), dtype=np.uint8) * 255
-        
-        # Размер маркера с рамкой
-        marker_size_px = int(self.config.aruco_marker_size_mm / 25.4 * dpi)
-        border_size = int(marker_size_px * 0.2)
-        total_size = marker_size_px + 2 * border_size
-        
-        # Расположение маркеров на листе
-        margin = int(20 / 25.4 * dpi)  # 20mm margin
-        x_spacing = int(10 / 25.4 * dpi)  # 10mm spacing
-        y_spacing = int(15 / 25.4 * dpi)  # 15mm spacing
-        
-        markers_per_row = (a4_width_px - 2 * margin) // (total_size + x_spacing)
-        
-        for i in range(12):
-            row = i // markers_per_row
-            col = i % markers_per_row
-            
-            x = margin + col * (total_size + x_spacing)
-            y = margin + row * (total_size + y_spacing + int(10 / 25.4 * dpi))  # Extra space for text
-            
-            if y + total_size > a4_height_px - margin:
-                break  # Не помещается на лист
-            
-            # Генерируем маркер
-            marker_img = cv2.aruco.generateImageMarker(
-                self.aruco_dict, i, marker_size_px
-            )
-            
-            # Вставляем маркер на лист
-            sheet[y:y+marker_size_px, x:x+marker_size_px] = marker_img
-            
-            # Добавляем рамку
-            cv2.rectangle(sheet, 
-                         (x - border_size, y - border_size),
-                         (x + marker_size_px + border_size, y + marker_size_px + border_size),
-                         0, 2)
-            
-            # Добавляем подпись
-            body_part = self.aruco_mapping.get(i, "Unknown")
-            text = f"ID:{i} - {body_part}"
-            cv2.putText(sheet, text,
-                       (x, y + marker_size_px + border_size + 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, 0, 1)
-        
-        # Сохраняем лист
-        sheet_filename = os.path.join(output_dir, "aruco_4x4_50_print_sheet.png")
-        cv2.imwrite(sheet_filename, sheet)
-        print(f"\n✓ Лист для печати сохранен: {sheet_filename}")
-        print(f"  Размер листа: A4 ({dpi}DPI)")
-        print(f"  Размер маркеров: {self.config.aruco_marker_size_mm}мм")
-
-class LightweightMediaPipeDetector:
-    """Облегченный детектор MediaPipe"""
-    def __init__(self, config: Config):
-        self.config = config
+        # Инициализация MediaPipe
         self.mp_pose = mp.solutions.pose
+        self.mp_hands = mp.solutions.hands
+        self.mp_drawing = mp.solutions.drawing_utils
         
-        # Минимальные настройки для производительности
         self.pose = self.mp_pose.Pose(
             static_image_mode=False,
-            model_complexity=0,  # Самая легкая модель
-            smooth_landmarks=True,
-            enable_segmentation=False,
-            smooth_segmentation=False,
-            min_detection_confidence=config.min_detection_confidence,
-            min_tracking_confidence=config.min_tracking_confidence
+            model_complexity=config.mp_model_complexity,
+            min_detection_confidence=config.mp_detection_confidence,
+            min_tracking_confidence=config.mp_tracking_confidence
         )
         
-        self.frame_counter = 0
-        self.last_body = None
+        self.hands = self.mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            min_detection_confidence=config.mp_detection_confidence,
+            min_tracking_confidence=config.mp_tracking_confidence
+        )
         
-        # Только необходимые точки MediaPipe
-        self.mediapipe_mapping = {
-            0: 'head',  # nose
-            11: 'left_shoulder',
-            12: 'right_shoulder',
-            23: 'pelvis',  # left hip
-            13: 'left_elbow',
-            15: 'left_hand',  # left wrist
-            14: 'right_elbow',
-            16: 'right_hand',  # right wrist
-            25: 'left_knee',
-            27: 'left_foot',  # left ankle
-            26: 'right_knee',
-            28: 'right_foot'  # right ankle
-        }
-    
-    def detect(self, frame: np.ndarray) -> Optional[BodyLandmarks]:
-        """Детекция с пропуском кадров"""
-        self.frame_counter += 1
-        
-        # Пропускаем кадры для экономии ресурсов
-        if self.frame_counter % self.config.skip_frames != 0:
-            return self.last_body
-        
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.pose.process(rgb_frame)
-        
-        if results.pose_landmarks:
-            body = BodyLandmarks()
-            h, w = frame.shape[:2]
-            
-            for mp_idx, body_part in self.mediapipe_mapping.items():
-                if mp_idx < len(results.pose_landmarks.landmark):
-                    landmark = results.pose_landmarks.landmark[mp_idx]
-                    if landmark.visibility > 0.5:  # Только видимые точки
-                        x = int(landmark.x * w)
-                        y = int(landmark.y * h)
-                        body.landmarks[body_part] = (x, y, landmark.visibility)
-            
-            self.last_body = body
-            return body
-        
-        return self.last_body
-
-class SimpleCursorController:
-    """Простой контроллер курсора"""
-    def __init__(self, config: Config):
-        self.config = config
-        self.screen_width, self.screen_height = pyautogui.size()
-        self.smoothed_x = self.screen_width // 2
-        self.smoothed_y = self.screen_height // 2
-        self.active_hand = None
-    
-    def update(self, body: BodyLandmarks, frame_shape: Tuple[int, int]):
-        """Обновление позиции курсора"""
-        if not body:
-            return
-        
-        h, w = frame_shape[:2]
-        
-        # Определяем активную руку
-        hand_position = None
-        if body.landmarks.get('right_hand'):
-            hand_position = body.landmarks['right_hand']
-            self.active_hand = 'right'
-        elif body.landmarks.get('left_hand'):
-            hand_position = body.landmarks['left_hand']
-            self.active_hand = 'left'
-        
-        if not hand_position:
-            return
-        
-        # Преобразуем координаты
-        target_x = int((hand_position[0] / w) * self.screen_width)
-        target_y = int((hand_position[1] / h) * self.screen_height)
-        
-        # Применяем сглаживание
-        self.smoothed_x += (target_x - self.smoothed_x) * self.config.cursor_smoothing
-        self.smoothed_y += (target_y - self.smoothed_y) * self.config.cursor_smoothing
-        
-        # Перемещаем курсор
+        # Инициализация ArUco с новым API
         try:
-            pyautogui.moveTo(int(self.smoothed_x), int(self.smoothed_y), duration=0)
-        except:
-            pass
-
-class MotionCaptureApp:
-    """Основное приложение"""
-    def __init__(self, config: Config):
-        self.config = config
-        self.aruco_detector = ArUco4x4Detector(config)
-        self.mediapipe_detector = LightweightMediaPipeDetector(config)
-        self.cursor_controller = SimpleCursorController(config)
+            # Получаем словарь ArUco
+            aruco_dict_id = getattr(cv2.aruco, config.aruco_dict_type)
+            self.aruco_dict = cv2.aruco.getPredefinedDictionary(aruco_dict_id)
+            
+            # Создаем детектор с новым API
+            self.aruco_params = cv2.aruco.DetectorParameters()
+            self.aruco_detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
+        except AttributeError:
+            # Fallback для старых версий OpenCV
+            logger.warning("Используется старый API ArUco")
+            self.aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_50)
+            self.aruco_params = cv2.aruco.DetectorParameters_create()
+            self.aruco_detector = None
         
-        self.cap = None
-        self.running = False
-        self.fps_history = []
-        self.last_time = time.time()
+        # Калибровка камеры (упрощенная)
+        self.camera_matrix = np.array([[800, 0, config.camera_width/2],
+                                      [0, 800, config.camera_height/2],
+                                      [0, 0, 1]], dtype=float)
+        self.dist_coeffs = np.zeros((4,1))
+        
+        # Фильтры Калмана для сглаживания
+        self.kalman_filters = {}
+        
+        # История детекций для стабилизации
+        self.detection_history = {}
+        
+        # Управление курсором
+        self.cursor_position = None
+        self.cursor_kalman = KalmanFilter() if config.use_kalman_filter else None
+        
+    def process_frame(self, frame: np.ndarray) -> Dict:
+        """Обработка кадра в зависимости от режима"""
+        results = {
+            'pose_landmarks': None,
+            'hand_landmarks': None,
+            'aruco_markers': {},
+            'cursor_control': None
+        }
+        
+        if self.config.detection_mode in [DetectionMode.MEDIAPIPE_ONLY, DetectionMode.HYBRID]:
+            results.update(self._process_mediapipe(frame))
+        
+        if self.config.detection_mode in [DetectionMode.ARUCO_ONLY, DetectionMode.HYBRID]:
+            results.update(self._process_aruco(frame))
+        
+        # Определение управления курсором
+        if results['hand_landmarks']:
+            results['cursor_control'] = self._calculate_cursor_position(
+                results['hand_landmarks'], frame.shape
+            )
+        
+        return results
     
-    def start(self):
-        """Запуск приложения"""
-        # Генерируем маркеры при первом запуске
-        if not os.path.exists("aruco_4x4_50_markers"):
-            print("Генерация ArUco 4x4_50 маркеров...")
-            self.aruco_detector.generate_markers()
+    def _process_mediapipe(self, frame: np.ndarray) -> Dict:
+        """Обработка MediaPipe"""
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        self.cap = cv2.VideoCapture(self.config.camera_index)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.camera_width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.camera_height)
-        self.cap.set(cv2.CAP_PROP_FPS, self.config.fps)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        pose_results = self.pose.process(rgb_frame)
+        hands_results = self.hands.process(rgb_frame)
         
-        # Попробуем установить формат для лучшей производительности
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+        results = {}
         
-        if not self.cap.isOpened():
-            print("Ошибка: не удалось открыть камеру")
+        if pose_results.pose_landmarks:
+            results['pose_landmarks'] = pose_results.pose_landmarks
+        
+        if hands_results.multi_hand_landmarks:
+            results['hand_landmarks'] = hands_results.multi_hand_landmarks[0]  # Берем первую руку
+        
+        return results
+    
+    def _process_aruco(self, frame: np.ndarray) -> Dict:
+        """Обработка ArUco маркеров"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Используем новый или старый API в зависимости от версии
+        if self.aruco_detector:
+            corners, ids, _ = self.aruco_detector.detectMarkers(gray)
+        else:
+            corners, ids, _ = cv2.aruco.detectMarkers(gray, self.aruco_dict, parameters=self.aruco_params)
+        
+        aruco_markers = {}
+        
+        if ids is not None:
+            for i, marker_id in enumerate(ids.flatten()):
+                if marker_id in self.ARUCO_MARKERS:
+                    # Оценка позы маркера
+                    try:
+                        # Новый API
+                        rvec, tvec, _ = cv2.aruco.estimatePoseSingleMarkers(
+                            corners[i], self.config.aruco_marker_size, 
+                            self.camera_matrix, self.dist_coeffs
+                        )
+                    except:
+                        # Альтернативный метод для новых версий
+                        rvec = np.zeros((1, 1, 3))
+                        tvec = np.zeros((1, 1, 3))
+                    
+                    # Получение центра маркера
+                    center = np.mean(corners[i][0], axis=0)
+                    
+                    # Применение фильтра Калмана если включено
+                    if self.config.use_kalman_filter:
+                        filter_key = f"aruco_{marker_id}"
+                        if filter_key not in self.kalman_filters:
+                            self.kalman_filters[filter_key] = KalmanFilter()
+                        center = self.kalman_filters[filter_key].update(center[0], center[1])
+                    
+                    aruco_markers[self.ARUCO_MARKERS[marker_id]] = {
+                        'position': center,
+                        'corners': corners[i][0],
+                        'rvec': rvec,
+                        'tvec': tvec
+                    }
+        
+        return {'aruco_markers': aruco_markers}
+    
+    def _calculate_cursor_position(self, hand_landmarks, frame_shape) -> Optional[Tuple[int, int]]:
+        """Расчет позиции курсора на основе положения руки"""
+        # Используем указательный палец для управления
+        index_finger = hand_landmarks.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_TIP]
+        
+        # Преобразование нормализованных координат в экранные
+        x = index_finger.x * frame_shape[1]
+        y = index_finger.y * frame_shape[0]
+        
+        # Применение фильтра Калмана
+        if self.cursor_kalman:
+            x, y = self.cursor_kalman.update(x, y)
+        
+        # Масштабирование на размер экрана
+        screen_x = int(x * self.config.screen_width / frame_shape[1] * self.config.cursor_sensitivity)
+        screen_y = int(y * self.config.screen_height / frame_shape[0] * self.config.cursor_sensitivity)
+        
+        # Ограничение координат экраном
+        screen_x = max(0, min(screen_x, self.config.screen_width - 1))
+        screen_y = max(0, min(screen_y, self.config.screen_height - 1))
+        
+        return (screen_x, screen_y)
+    
+    def draw_results(self, frame: np.ndarray, results: Dict) -> np.ndarray:
+        """Отрисовка результатов на кадре"""
+        # Отрисовка MediaPipe
+        if results.get('pose_landmarks'):
+            self.mp_drawing.draw_landmarks(
+                frame, results['pose_landmarks'], self.mp_pose.POSE_CONNECTIONS
+            )
+        
+        if results.get('hand_landmarks'):
+            self.mp_drawing.draw_landmarks(
+                frame, results['hand_landmarks'], self.mp_hands.HAND_CONNECTIONS
+            )
+        
+        # Отрисовка ArUco
+        for body_part, marker_data in results.get('aruco_markers', {}).items():
+            corners = marker_data['corners']
+            cv2.polylines(frame, [corners.astype(int)], True, (0, 255, 0), 2)
+            
+            # Подпись части тела
+            center = tuple(np.mean(corners, axis=0).astype(int))
+            cv2.putText(frame, body_part, center, cv2.FONT_HERSHEY_SIMPLEX, 
+                       0.5, (255, 0, 0), 2)
+        
+        # Отображение информации о курсоре
+        if results.get('cursor_control'):
+            x, y = results['cursor_control']
+            cv2.putText(frame, f"Cursor: ({x}, {y})", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        # Отображение режима
+        mode_text = f"Mode: {self.config.detection_mode.value}"
+        cv2.putText(frame, mode_text, (10, frame.shape[0] - 10), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        
+        return frame
+
+class CursorController(threading.Thread):
+    """Поток для управления курсором"""
+    def __init__(self, config: AppConfig):
+        super().__init__()
+        self.config = config
+        self.cursor_queue = queue.Queue()
+        self.running = True
+        self.daemon = True
+        
+    def run(self):
+        """Основной цикл управления курсором"""
+        last_position = None
+        
+        while self.running:
+            try:
+                position = self.cursor_queue.get(timeout=0.1)
+                
+                if position and last_position:
+                    # Плавное перемещение курсора
+                    smooth_x = last_position[0] + (position[0] - last_position[0]) * self.config.cursor_smoothing
+                    smooth_y = last_position[1] + (position[1] - last_position[1]) * self.config.cursor_smoothing
+                    
+                    pyautogui.moveTo(smooth_x, smooth_y, duration=0)
+                    last_position = (smooth_x, smooth_y)
+                elif position:
+                    pyautogui.moveTo(position[0], position[1], duration=0)
+                    last_position = position
+                    
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Ошибка управления курсором: {e}")
+    
+    def update_position(self, position: Optional[Tuple[int, int]]):
+        """Обновление позиции курсора"""
+        if position:
+            try:
+                self.cursor_queue.put_nowait(position)
+            except queue.Full:
+                # Очищаем очередь если она переполнена
+                try:
+                    self.cursor_queue.get_nowait()
+                    self.cursor_queue.put_nowait(position)
+                except queue.Empty:
+                    pass
+    
+    def stop(self):
+        """Остановка потока"""
+        self.running = False
+
+class Application:
+    """Основное приложение"""
+    def __init__(self, config: AppConfig = None):
+        self.config = config or AppConfig()
+        self.tracker = BodyTracker(self.config)
+        self.cursor_controller = CursorController(self.config)
+        self.running = False
+        
+        # Статистика производительности
+        self.fps_counter = 0
+        self.fps_start_time = time.time()
+        self.current_fps = 0
+        
+        # Настройка горячих клавиш
+        self.key_bindings = {
+            ord('q'): self.quit,
+            ord('m'): lambda: self.switch_mode(DetectionMode.MEDIAPIPE_ONLY),
+            ord('a'): lambda: self.switch_mode(DetectionMode.ARUCO_ONLY),
+            ord('h'): lambda: self.switch_mode(DetectionMode.HYBRID),
+            ord('s'): self.save_config,
+            ord('l'): self.load_config,
+            ord('c'): self.toggle_cursor_control,
+            ord('k'): self.toggle_kalman_filter,
+            ord('r'): self.reset_tracking,
+            ord('+'): lambda: self.adjust_sensitivity(0.1),
+            ord('-'): lambda: self.adjust_sensitivity(-0.1),
+            ord('i'): self.show_info,
+            27: self.quit  # ESC key
+        }
+        
+        self.cursor_control_enabled = True
+        self.show_debug_info = True
+        
+    def initialize_camera(self) -> Optional[cv2.VideoCapture]:
+        """Инициализация камеры"""
+        cap = cv2.VideoCapture(self.config.camera_index)
+        
+        if not cap.isOpened():
+            logger.error(f"Не удалось открыть камеру {self.config.camera_index}")
+            return None
+        
+        # Установка параметров камеры
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.camera_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.camera_height)
+        cap.set(cv2.CAP_PROP_FPS, self.config.fps)
+        
+        # Проверка фактических параметров
+        actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = int(cap.get(cv2.CAP_PROP_FPS))
+        
+        logger.info(f"Камера инициализирована: {actual_width}x{actual_height} @ {actual_fps} FPS")
+        
+        return cap
+    
+    def run(self):
+        """Основной цикл приложения"""
+        cap = self.initialize_camera()
+        if not cap:
             return
         
         self.running = True
-        self.run()
-    
-    def calculate_fps(self):
-        """Расчет FPS"""
-        current_time = time.time()
-        fps = 1.0 / (current_time - self.last_time)
-        self.last_time = current_time
+        self.cursor_controller.start()
         
-        self.fps_history.append(fps)
-        if len(self.fps_history) > 30:
-            self.fps_history.pop(0)
+        # Создание окна
+        cv2.namedWindow('Body Tracking', cv2.WINDOW_NORMAL)
+        cv2.resizeWindow('Body Tracking', 1280, 720)
         
-        return sum(self.fps_history) / len(self.fps_history) if self.fps_history else 0
-    
-    def run(self):
-        """Основной цикл"""
-        while self.running:
-            ret, frame = self.cap.read()
-            if not ret:
-                continue
-            
-            frame = cv2.flip(frame, 1)
-            
-            # Детекция в зависимости от режима
-            body = None
-            detected_corners = None
-            detected_ids = None
-            
-            if self.config.detection_mode == DetectionMode.ARUCO_ONLY:
-                # Только ArUco
-                gray = self.aruco_detector.preprocess_image(frame)
-                detected_corners, detected_ids, _ = self.aruco_detector.detector.detectMarkers(gray)
-                body = self.aruco_detector.detect(frame)
+        try:
+            while self.running:
+                ret, frame = cap.read()
+                if not ret:
+                    logger.error("Не удалось получить кадр с камеры")
+                    break
                 
-            elif self.config.detection_mode == DetectionMode.MEDIAPIPE_ONLY:
-                # Только MediaPipe
-                body = self.mediapipe_detector.detect(frame)
+                # Обработка кадра
+                results = self.tracker.process_frame(frame)
                 
-            elif self.config.detection_mode == DetectionMode.HYBRID:
-                # Гибридный режим
-                gray = self.aruco_detector.preprocess_image(frame)
-                detected_corners, detected_ids, _ = self.aruco_detector.detector.detectMarkers(gray)
-                aruco_body = self.aruco_detector.detect(frame)
+                # Управление курсором
+                if self.cursor_control_enabled and results.get('cursor_control'):
+                    self.cursor_controller.update_position(results['cursor_control'])
                 
-                # MediaPipe только если не все маркеры найдены
-                if not aruco_body or len([v for v in aruco_body.landmarks.values() if v]) < 6:
-                    mp_body = self.mediapipe_detector.detect(frame)
-                    
-                    if aruco_body and mp_body:
-                        # Объединяем результаты
-                        body = aruco_body
-                        for part, coords in mp_body.landmarks.items():
-                            if not body.landmarks.get(part) and coords:
-                                body.landmarks[part] = coords
-                    elif mp_body:
-                        body = mp_body
-                else:
-                    body = aruco_body
+                # Отрисовка результатов
+                frame = self.tracker.draw_results(frame, results)
+                
+                # Добавление отладочной информации
+                if self.show_debug_info:
+                    frame = self.draw_debug_info(frame, results)
+                
+                # Отображение кадра
+                cv2.imshow('Body Tracking', frame)
+                
+                # Обновление FPS
+                self.update_fps()
+                
+                # Обработка клавиш
+                key = cv2.waitKey(1) & 0xFF
+                if key in self.key_bindings:
+                    self.key_bindings[key]()
+                
+        except Exception as e:
+            logger.error(f"Ошибка в основном цикле: {e}")
+            import traceback
+            traceback.print_exc()
             
-            # Отрисовка
-            if detected_corners is not None and detected_ids is not None:
-                self.aruco_detector.draw(frame, detected_corners, detected_ids)
-            
-            if body and self.config.show_skeleton:
-                self.draw_skeleton(frame, body)
-            
-            # Управление курсором
-            if body:
-                self.cursor_controller.update(body, frame.shape)
-            
-            # Отображение информации
-            self.draw_info(frame, body)
-            
-            cv2.imshow('Motion Capture - ArUco 4x4_50', frame)
-            
-            # Обработка клавиш
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('m'):
-                modes = list(DetectionMode)
-                current_idx = modes.index(self.config.detection_mode)
-                self.config.detection_mode = modes[(current_idx + 1) % len(modes)]
-                print(f"Режим: {self.config.detection_mode.value}")
-            elif key == ord('g'):
-                print("Генерация маркеров...")
-                self.aruco_detector.generate_markers()
-            elif key == ord('s'):
-                self.config.save()
-                print("Настройки сохранены")
-            elif key == ord('t'):
-                # Тестовый режим - показать все возможные маркеры
-                self.test_aruco_detection(frame)
-        
-        self.stop()
+        finally:
+            self.cleanup(cap)
     
-    def draw_skeleton(self, frame: np.ndarray, body: BodyLandmarks):
-        """Отрисовка скелета"""
-        connections = [
-            ('head', 'left_shoulder'),
-            ('head', 'right_shoulder'),
-            ('left_shoulder', 'right_shoulder'),
-            ('left_shoulder', 'left_elbow'),
-            ('left_elbow', 'left_hand'),
-            ('right_shoulder', 'right_elbow'),
-            ('right_elbow', 'right_hand'),
-            ('left_shoulder', 'pelvis'),
-            ('right_shoulder', 'pelvis'),
-            ('pelvis', 'left_knee'),
-            ('left_knee', 'left_foot'),
-            ('pelvis', 'right_knee'),
-            ('right_knee', 'right_foot')
-        ]
+    def draw_debug_info(self, frame: np.ndarray, results: Dict) -> np.ndarray:
+        """Отрисовка отладочной информации"""
+        info_y = 60
+        line_height = 25
         
-        # Рисуем соединения
-        for start, end in connections:
-            if body.landmarks.get(start) and body.landmarks.get(end):
-                cv2.line(frame, 
-                        body.landmarks[start][:2], 
-                        body.landmarks[end][:2], 
-                        (0, 255, 0), 2)
-        
-        # Рисуем точки
-        for name, point in body.landmarks.items():
-            if point:
-                cv2.circle(frame, point[:2], 5, (0, 0, 255), -1)
-    
-    def draw_info(self, frame: np.ndarray, body: BodyLandmarks):
-        """Отображение информации"""
         # FPS
-        if self.config.show_fps:
-            fps = self.calculate_fps()
-            cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"FPS: {self.current_fps:.1f}", (10, info_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        info_y += line_height
         
-        # Режим
-        cv2.putText(frame, f"Mode: {self.config.detection_mode.value}", (10, 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        # Количество обнаруженных объектов
+        pose_count = 1 if results.get('pose_landmarks') else 0
+        hand_count = 1 if results.get('hand_landmarks') else 0
+        aruco_count = len(results.get('aruco_markers', {}))
         
-        # Количество обнаруженных точек
-        if body:
-            detected_count = sum(1 for v in body.landmarks.values() if v)
-            cv2.putText(frame, f"Detected: {detected_count}/12", (10, 90),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(frame, f"Pose: {pose_count}, Hands: {hand_count}, ArUco: {aruco_count}", 
+                   (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        info_y += line_height
         
-        # Активная рука
-        if self.cursor_controller.active_hand:
-            cv2.putText(frame, f"Hand: {self.cursor_controller.active_hand}", (10, 120),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+        # Статус курсора
+        cursor_status = "ON" if self.cursor_control_enabled else "OFF"
+        cv2.putText(frame, f"Cursor Control: {cursor_status}", (10, info_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        info_y += line_height
+        
+        # Фильтр Калмана
+        kalman_status = "ON" if self.config.use_kalman_filter else "OFF"
+        cv2.putText(frame, f"Kalman Filter: {kalman_status}", (10, info_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        info_y += line_height
+        
+        # Чувствительность курсора
+        cv2.putText(frame, f"Sensitivity: {self.config.cursor_sensitivity:.1f}", (10, info_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         
         # Инструкции
-        instructions = "Q-quit | M-mode | G-generate | S-save | T-test"
-        cv2.putText(frame, instructions, (10, frame.shape[0] - 10),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-    
-    def test_aruco_detection(self, frame):
-        """Тестовый режим для проверки всех типов ArUco"""
-        test_window = "ArUco Detection Test"
-        
-        # Тестируем разные словари
-        test_dicts = [
-            (cv2.aruco.DICT_4X4_50, "4X4_50"),
-            (cv2.aruco.DICT_4X4_100, "4X4_100"),
-            (cv2.aruco.DICT_5X5_50, "5X5_50"),
-            (cv2.aruco.DICT_6X6_50, "6X6_50")
+        instructions = [
+            "Q/ESC - Quit | M - MediaPipe | A - ArUco | H - Hybrid",
+            "C - Toggle Cursor | K - Toggle Kalman | I - Toggle Info",
+            "+/- Adjust Sensitivity | S - Save Config | L - Load Config | R - Reset"
         ]
         
-        results = []
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        for i, instruction in enumerate(instructions):
+            cv2.putText(frame, instruction, (10, frame.shape[0] - 80 + i * 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         
-        for dict_type, dict_name in test_dicts:
-            aruco_dict = cv2.aruco.getPredefinedDictionary(dict_type)
-            detector = cv2.aruco.ArucoDetector(aruco_dict, self.aruco_detector.aruco_params)
-            corners, ids, _ = detector.detectMarkers(gray)
-            
-            if ids is not None:
-                results.append(f"{dict_name}: {len(ids)} markers found (IDs: {ids.flatten().tolist()})")
-            else:
-                results.append(f"{dict_name}: No markers found")
-        
-        # Показываем результаты
-        test_frame = np.ones((300, 600, 3), dtype=np.uint8) * 255
-        for i, result in enumerate(results):
-            cv2.putText(test_frame, result, (10, 30 + i * 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
-        
-        cv2.imshow(test_window, test_frame)
-        cv2.waitKey(2000)
-        cv2.destroyWindow(test_window)
+        return frame
     
-    def stop(self):
-        """Остановка приложения"""
+    def update_fps(self):
+        """Обновление счетчика FPS"""
+        self.fps_counter += 1
+        current_time = time.time()
+        
+        if current_time - self.fps_start_time >= 1.0:
+            self.current_fps = self.fps_counter / (current_time - self.fps_start_time)
+            self.fps_counter = 0
+            self.fps_start_time = current_time
+    
+    def switch_mode(self, mode: DetectionMode):
+        """Переключение режима детекции"""
+        self.config.detection_mode = mode
+        logger.info(f"Режим переключен на: {mode.value}")
+    
+    def toggle_cursor_control(self):
+        """Включение/выключение управления курсором"""
+        self.cursor_control_enabled = not self.cursor_control_enabled
+        logger.info(f"Управление курсором: {'включено' if self.cursor_control_enabled else 'выключено'}")
+    
+    def toggle_kalman_filter(self):
+        """Включение/выключение фильтра Калмана"""
+        self.config.use_kalman_filter = not self.config.use_kalman_filter
+        # Очищаем существующие фильтры
+        self.tracker.kalman_filters.clear()
+        self.tracker.cursor_kalman = KalmanFilter() if self.config.use_kalman_filter else None
+        logger.info(f"Фильтр Калмана: {'включен' if self.config.use_kalman_filter else 'выключен'}")
+    
+    def adjust_sensitivity(self, delta: float):
+        """Регулировка чувствительности курсора"""
+        self.config.cursor_sensitivity = max(0.1, min(5.0, self.config.cursor_sensitivity + delta))
+        logger.info(f"Чувствительность курсора: {self.config.cursor_sensitivity:.1f}")
+    
+    def show_info(self):
+        """Переключение отображения отладочной информации"""
+        self.show_debug_info = not self.show_debug_info
+    
+    def reset_tracking(self):
+        """Сброс отслеживания"""
+        self.tracker.kalman_filters.clear()
+        self.tracker.detection_history.clear()
+        if self.config.use_kalman_filter:
+            self.tracker.cursor_kalman = KalmanFilter()
+        logger.info("Отслеживание сброшено")
+    
+    def save_config(self):
+        """Сохранение конфигурации"""
+        self.config.save()
+        logger.info("Конфигурация сохранена")
+    
+    def load_config(self):
+        """Загрузка конфигурации"""
+        self.config = AppConfig.load()
+        self.tracker.config = self.config
+        self.cursor_controller.config = self.config
+        logger.info("Конфигурация загружена")
+    
+    def quit(self):
+        """Выход из приложения"""
         self.running = False
-        if self.cap:
-            self.cap.release()
+    
+    def cleanup(self, cap: cv2.VideoCapture):
+        """Очистка ресурсов"""
+        logger.info("Завершение работы...")
+        
+        self.cursor_controller.stop()
+        self.cursor_controller.join(timeout=1.0)
+        
+        cap.release()
         cv2.destroyAllWindows()
+        
+        logger.info("Приложение завершено")
+
+def print_aruco_markers():
+    """Функция для генерации и сохранения ArUco маркеров"""
+    import os
+    
+    # Создаем папку для маркеров
+    os.makedirs("aruco_markers", exist_ok=True)
+    
+    # Генерируем маркеры
+    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    
+    marker_names = {
+        0: 'head',
+        1: 'left_shoulder',
+        2: 'right_shoulder',
+        3: 'pelvis',
+        4: 'left_elbow',
+        5: 'left_wrist',
+        6: 'right_elbow',
+        7: 'right_wrist',
+        8: 'left_knee',
+        9: 'left_ankle',
+        10: 'right_knee',
+        11: 'right_ankle'
+    }
+    
+    for marker_id, body_part in marker_names.items():
+        marker_image = cv2.aruco.generateImageMarker(aruco_dict, marker_id, 200)
+        filename = f"aruco_markers/marker_{marker_id}_{body_part}.png"
+        cv2.imwrite(filename, marker_image)
+        logger.info(f"Сохранен маркер: {filename}")
 
 def main():
-    """Точка входа"""
-    config = Config.load()
-    app = MotionCaptureApp(config)
+    """Точка входа в приложение"""
+    import sys
     
-    print("\n=== Motion Capture с ArUco 4x4_50 ===")
-    print("\nМаркеры ArUco 4x4_50:")
-    print("  ID 0  - Голова")
-    print("  ID 1  - Левое плечо")
-    print("  ID 2  - Правое плечо")
-    print("  ID 3  - Таз")
-    print("  ID 4  - Левый локоть")
-    print("  ID 5  - Левая ладонь")
-    print("  ID 6  - Правый локоть")
-    print("  ID 7  - Правая ладонь")
-    print("  ID 8  - Левое колено")
-    print("  ID 9  - Левая ступня")
-    print("  ID 10 - Правое колено")
-    print("  ID 11 - Правая ступня")
-    print("\nУправление:")
-    print("  Q - Выход")
-    print("  M - Переключение режима")
-    print("  G - Генерация маркеров")
-    print("  S - Сохранение настроек")
-    print("  T - Тест детекции ArUco")
-    print("=====================================\n")
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--generate-markers":
+        print_aruco_markers()
+        return
+    
+
+    pyautogui.FAILSAFE = True
+    pyautogui.PAUSE = 0.01
+    
+    # Загрузка или создание конфигурации
+    config = AppConfig.load()
+    
+    # Создание и запуск приложения
+    app = Application(config)
     
     try:
-        app.start()
+        app.run()
     except KeyboardInterrupt:
-        print("\nОстановка...")
-        app.stop()
+        logger.info("Прерывание пользователем")
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
